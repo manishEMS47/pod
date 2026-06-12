@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import base64
 import requests
 import time
 import subprocess
@@ -18,12 +19,14 @@ max_workers = 3  # cartesia default is 3. you have to upgrade to use more.
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
+SIXTYDB_API_KEY = os.getenv("SIXTYDB_API_KEY")
 
 def validate_api_keys():
     required_keys = {
         "ELEVENLABS_API_KEY": ELEVENLABS_API_KEY,
         "OPENAI_API_KEY": OPENAI_API_KEY,
-        "CARTESIA_API_KEY": CARTESIA_API_KEY
+        "CARTESIA_API_KEY": CARTESIA_API_KEY,
+        "SIXTYDB_API_KEY": SIXTYDB_API_KEY
     }
 
     for key_name, key_value in required_keys.items():
@@ -111,15 +114,15 @@ def generate_dialogue():
 
     return response.choices[0].message.function_call.arguments
 
-def text_to_speech_file(name: str, text: str, voice_id: str, temp_folder: str, history: list, use_cartesia: bool = False, progress: tuple = None) -> tuple:
+def text_to_speech_file(name: str, text: str, voice_id: str, temp_folder: str, history: list, provider: str = "elevenlabs", progress: tuple = None) -> tuple:
     if progress:
         current, total = progress
-        log("TTS_PROGRESS", f"Converting text to speech for voice {voice_id} ({current}/{total})...")
+        log("TTS_PROGRESS", f"Converting text to speech via {provider} for voice {voice_id} ({current}/{total})...")
     else:
-        log("TTS", f"Converting text to speech for voice {voice_id}...")
+        log("TTS", f"Converting text to speech via {provider} for voice {voice_id}...")
     start_time = time.time()
 
-    if use_cartesia:
+    if provider == "cartesia":
         # Use Cartesia API for Karan and Sarah
         url = "https://api.cartesia.ai/tts/bytes"
         headers = {
@@ -166,6 +169,41 @@ def text_to_speech_file(name: str, text: str, voice_id: str, temp_folder: str, h
         else:
             log("TTS_ERROR", f"Cartesia API error: {response.status_code} - {response.text}")
             return None, None, 0.0  # {{ edit_3 }}
+    elif provider == "60db":
+        # Use 60db (https://api.60db.ai) for Sarah
+        url = "https://api.60db.ai/tts-synthesize"
+        headers = {
+            "Authorization": f"Bearer {SIXTYDB_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "text": text + " ",  # trailing space to avoid clipping the last word, same as the others
+            "voice_id": voice_id,
+            "output_format": "mp3",     # keep MP3 across all providers for consistent combining
+            "stability": 50,            # 0-100 scale; matches ElevenLabs' 0.5
+            "similarity": 75,           # 0-100 scale; matches ElevenLabs' 0.75
+            "speed": 1,
+            "enhance": True
+        }
+
+        response = requests.post(url, json=data, headers=headers)
+        if response.status_code == 200:
+            result = response.json()
+            audio_base64 = result.get("audio_base64")
+            if not result.get("success", False) or not audio_base64:
+                log("TTS_ERROR", f"60db API error: {result.get('message', 'no audio returned')}")
+                return None, None, 0.0
+            save_file_path = os.path.join(temp_folder, f"{current if progress else ''}-{name}-{uuid.uuid4()}.mp3".strip('-'))
+            with open(save_file_path, "wb") as f:
+                f.write(base64.b64decode(audio_base64))
+            generation_id = None  # 60db's TTS response carries no request/generation id
+
+            # Get duration using pydub (same as the other providers, keeps caption timestamps consistent)
+            audio = AudioSegment.from_mp3(save_file_path)
+            duration_sec = len(audio) / 1000.0
+        else:
+            log("TTS_ERROR", f"60db API error: {response.status_code} - {response.text}")
+            return None, None, 0.0
     else:
         # Use ElevenLabs for Charlie (Host)
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
@@ -227,28 +265,37 @@ def main():
     log("TEMP_FOLDER", f"Created temporary folder: {temp_folder}")
 
     voice_host_id = "IKne3meq5aSn9XLyUdCD"  # Charlie pre-made voice (ElevenLabs)
-    voice_karan_id = "638efaaa-4d0c-442e-b701-3fae16aad012"  # Replace with actual Cartesia voice ID for Karan
-    voice_sarah_id = "79a125e8-cd45-4c13-8a67-188112f4dd22"  # Replace with actual Cartesia voice ID for Sarah
+    voice_karan_id = "638efaaa-4d0c-442e-b701-3fae16aad012"  # Cartesia voice ID for Karan
+    voice_sarah_id = "REPLACE_WITH_60DB_VOICE_ID"  # 60db voice ID for Sarah (from GET https://api.60db.ai/myvoices)
 
     audio_files = {}  # {{ edit_6 }}
     history_host = []
     history_karan = []
     history_sarah = []
 
+    # Per-speaker routing: (provider, voice_id, history) -> Host=ElevenLabs, Karan=Cartesia, Sarah=60db
+    voice_config = {
+        "Host":  ("elevenlabs", voice_host_id,  history_host),
+        "Karan": ("cartesia",   voice_karan_id, history_karan),
+        "Sarah": ("60db",       voice_sarah_id, history_sarah),
+    }
+
     log("DIALOGUE_PROCESS", f"Processing {len(dialogue)} dialogue lines...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_index = {
-            executor.submit(
+        future_to_index = {}
+        for i, line in enumerate(dialogue):
+            provider, voice_id, history = voice_config[line['speaker']]
+            future = executor.submit(
                 text_to_speech_file,
                 line['speaker'],
                 line['text'],
-                voice_host_id if line['speaker'] == "Host" else (voice_karan_id if line['speaker'] == "Karan" else voice_sarah_id),
+                voice_id,
                 temp_folder,
-                history_host if line['speaker'] == "Host" else (history_karan if line['speaker'] == "Karan" else history_sarah),
-                False if line['speaker'] == "Host" else True,
+                history,
+                provider,
                 (i+1, len(dialogue))
-            ): i for i, line in enumerate(dialogue)
-        }
+            )
+            future_to_index[future] = i
         # Initialize list to hold transcript with timestamps
         transcript_with_timestamps = []  # {{ edit_7 }}
         current_time = 0.0  # {{ edit_8 }}
